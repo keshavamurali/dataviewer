@@ -75,18 +75,18 @@ def show(text: str) -> str:
 
 
 def hexdump_rows(text: str, limit: int = 2000):
-    """Same filter/format as view_pack.py hexdump(), as structured rows.
+    """Same format as view_pack.py hexdump(), as structured rows, but listing
+    every character (ASCII letters included), not just non-ASCII/control/separator.
 
     Each row: {offset, cp (U+XXXX), name}. Offsets are code-point indices.
     """
     rows = []
     for i, ch in enumerate(text[:limit]):
-        if ord(ch) > 127 or unicodedata.category(ch)[0] in "CZ":
-            rows.append({
-                "offset": i,
-                "cp": f"U+{ord(ch):04X}",
-                "name": unicodedata.name(ch, "?"),
-            })
+        rows.append({
+            "offset": i,
+            "cp": f"U+{ord(ch):04X}",
+            "name": unicodedata.name(ch, "?"),
+        })
     return rows
 
 
@@ -409,7 +409,7 @@ PAGE = r"""<!doctype html>
     <textarea id="exportBox" readonly placeholder="current row (CSV) appears here"></textarea>
     <div class="hint" id="exportMsg"></div>
 
-    <h3 id="hexHead">Hex dump (non-ASCII / control / separator)</h3>
+    <h3 id="hexHead">Hex dump (all characters)</h3>
     <div id="hexList"></div>
   </div>
 </div>
@@ -705,7 +705,7 @@ async function load(i){
   // hex dump
   const hl=$('hexList'); hl.innerHTML = cur.hexdump.length
     ? cur.hexdump.map(h=>'<div class="hexrow">'+String(h.offset).padStart(6)+'  '+h.cp+'  '+escapeHtml(h.name)+'</div>').join('')
-    : '<div class="hint">(no non-ASCII characters in the first part)</div>';
+    : '<div class="hint">(empty document)</div>';
   fillFields(cur.doc_id);
   $('status').innerHTML='offset: \u2013'; $('selstatus').innerHTML='';
 }
@@ -737,8 +737,19 @@ document.getElementById('diag').addEventListener('keyup', onCursor);
 document.addEventListener('selectionchange', ()=>{ if(document.activeElement && document.activeElement.tagName==='TEXTAREA') return; onCursor(); });
 
 // use current selection to fill evidence+hex
-$('f_evidence').addEventListener('focus', ()=>{ if(window._selFill && !$('f_evidence').value){ $('f_evidence').value=window._selFill.evidence; } });
-$('f_hex').addEventListener('focus', ()=>{ if(window._selFill && !$('f_hex').value){ $('f_hex').value=window._selFill.hex; } });
+// each new selection is appended once ("; "-separated); re-focusing without a new selection adds nothing
+function appendSelFill(fieldId, key){
+  const f = window._selFill;
+  const used = key+'Used';
+  if(!f || f[used]) return;
+  f[used] = true;
+  const el = $(fieldId);
+  if(el.value.split('; ').includes(f[key])) return;   // same span already recorded
+  el.value = el.value ? el.value+'; '+f[key] : f[key];
+  renderRowPreview();
+}
+$('f_evidence').addEventListener('focus', ()=>appendSelFill('f_evidence', 'evidence'));
+$('f_hex').addEventListener('focus', ()=>appendSelFill('f_hex', 'hex'));
 $('f_diseases').addEventListener('input', ()=>{ syncDiseaseChecks(); updateHexWarn(); renderRowPreview(); });
 ['f_read','f_verdict','f_evidence','f_hex','f_note'].forEach(id=>{
   $(id).addEventListener('input', renderRowPreview);

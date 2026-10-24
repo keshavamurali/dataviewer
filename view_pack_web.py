@@ -134,7 +134,8 @@ def segments(text: str):
 # ---------------------------------------------------------------------------
 class State:
     docs = []          # list of row dicts
-    out_path = None    # optional server-side CSV path
+    out_path = None    # CSV save path (default labels.csv in CWD)
+    doc_index = {}     # doc_id -> pack position, for stable CSV ordering
 
 
 def doc_payload(i: int):
@@ -166,6 +167,43 @@ def rows_to_csv(rows):
     return buf.getvalue()
 
 
+def read_csv_rows(path):
+    """Read labels.csv into {doc_id: rowdict}. Missing/empty file -> {}."""
+    if not path or not os.path.exists(path):
+        return {}
+    out = {}
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            did = (row.get("doc_id") or "").strip()
+            if did:
+                out[did] = {k: (row.get(k, "") or "") for k in FIELDNAMES}
+    return out
+
+
+def ordered_rows(rowmap):
+    """Rows sorted by pack position; unknown doc_ids go last, stable."""
+    def key(did):
+        return (0, State.doc_index[did]) if did in State.doc_index else (1, 0)
+    return [rowmap[d] for d in sorted(rowmap, key=lambda d: key(d))]
+
+
+def merge_save(incoming):
+    """Upsert incoming rows into the on-disk CSV by doc_id; never delete.
+
+    Re-reads the current file so rows the browser never touched are preserved.
+    Returns (abs_path, total_rows).
+    """
+    disk = read_csv_rows(State.out_path)
+    for r in incoming:
+        did = (r.get("doc_id") or "").strip()
+        if did:
+            disk[did] = {k: (r.get(k, "") or "") for k in FIELDNAMES}
+    csv_text = rows_to_csv(ordered_rows(disk))
+    with open(State.out_path, "w", encoding="utf-8", newline="") as f:
+        f.write(csv_text)
+    return os.path.abspath(State.out_path), len(disk)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quieter console
         pass
@@ -191,6 +229,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, PAGE, "text/html; charset=utf-8")
         elif path == "/api/count":
             self._json({"count": len(State.docs)})
+        elif path == "/api/rows":
+            # current on-disk labels.csv, keyed by doc_id (source of truth)
+            self._json({"rows": read_csv_rows(State.out_path)})
         elif path == "/api/doc":
             try:
                 i = int(params.get("i", "0"))
@@ -210,15 +251,10 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw.decode("utf-8")) if raw else {}
         except json.JSONDecodeError:
             return self._json({"error": "bad json"}, 400)
-        if path == "/api/export":
+        if path in ("/api/save", "/api/export"):
             rows = data.get("rows", [])
-            csv_text = rows_to_csv(rows)
-            saved = None
-            if State.out_path:
-                with open(State.out_path, "w", encoding="utf-8", newline="") as f:
-                    f.write(csv_text)
-                saved = os.path.abspath(State.out_path)
-            self._json({"csv": csv_text, "saved": saved, "rows": len(rows)})
+            saved_path, total = merge_save(rows)
+            self._json({"saved": saved_path, "rows": total})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -235,6 +271,7 @@ def main():
 
     State.docs = pq.read_table(a.pack).to_pylist()
     State.out_path = a.out
+    State.doc_index = {d.get("doc_id", ""): i for i, d in enumerate(State.docs)}
     start = max(0, min(a.start, len(State.docs) - 1)) if State.docs else 0
 
     global PAGE
@@ -361,12 +398,11 @@ PAGE = r"""<!doctype html>
       <div class="warn" id="hexWarn" style="display:none">F1/E3: leave hex empty. Never paste the value.</div></div>
     <div class="field"><label>note</label><input id="f_note"></div>
     <div class="row-actions">
-      <button id="saveRow">save row</button>
-      <button id="clearRow">clear</button>
+      <button id="clearRow">clear this row (UI only)</button>
       <span id="rowState" class="hint"></span>
     </div>
 
-    <h3>Save (<span id="savedCount">0</span> rows)</h3>
+    <h3>Save (<span id="savedCount">0</span> rows in file)</h3>
     <div class="row-actions">
       <button id="exportBtn">save labels.csv</button>
     </div>
@@ -437,7 +473,8 @@ let cur = null;           // current doc payload
 let idx = parseInt("__START__",10) || 0;
 const saved = {};         // doc_id -> row object (persisted in localStorage)
 const LS_KEY = 'view_pack_web_rows';
-try { Object.assign(saved, JSON.parse(localStorage.getItem(LS_KEY)||'{}')); } catch(e){}
+// NOTE: seeding happens in bootstrap(): CSV (source of truth) first,
+// then localStorage overlaid on top as the unsaved-edit buffer.
 
 const $ = id => document.getElementById(id);
 
@@ -654,6 +691,7 @@ function renderRowPreview(){
 }
 
 async function load(i){
+  commitCurrent();            // keep in-progress edits when traversing
   const res = await fetch('/api/doc?i='+i);
   if(!res.ok){ return; }
   cur = await res.json(); idx = cur.i;
@@ -707,30 +745,36 @@ $('f_diseases').addEventListener('input', ()=>{ syncDiseaseChecks(); updateHexWa
   $(id).addEventListener('change', renderRowPreview);
 });
 
-$('saveRow').onclick = ()=>{
+// Commit the current doc's field values into the in-memory store + localStorage
+// buffer (does NOT touch disk). Called on navigation and before saving.
+function commitCurrent(){
   if(!cur) return;
-  saved[cur.doc_id] = {
-    doc_id: cur.doc_id, read:$('f_read').value, verdict:$('f_verdict').value,
-    diseases:$('f_diseases').value, evidence:$('f_evidence').value,
-    hex:$('f_hex').value, note:$('f_note').value };
+  const r = currentRowValues();
+  // keep a row only if something was entered
+  const nonEmpty = ['read','verdict','diseases','evidence','hex','note'].some(k=>r[k]);
+  if(nonEmpty){ saved[cur.doc_id] = r; }
   localStorage.setItem(LS_KEY, JSON.stringify(saved));
-  $('rowState').textContent='saved';
   $('savedCount').textContent = Object.keys(saved).length;
-};
+}
+
 $('clearRow').onclick = ()=>{
   if(!cur) return; delete saved[cur.doc_id];
   localStorage.setItem(LS_KEY, JSON.stringify(saved));
   fillFields(cur.doc_id); $('savedCount').textContent = Object.keys(saved).length;
+  $('exportMsg').textContent = 'cleared in UI (labels.csv unchanged; delete rows there manually)';
 };
 
 $('exportBtn').onclick = async ()=>{
+  commitCurrent();
   const rows = Object.values(saved);
-  const res = await fetch('/api/export', {method:'POST', headers:{'Content-Type':'application/json'},
+  const res = await fetch('/api/save', {method:'POST', headers:{'Content-Type':'application/json'},
      body: JSON.stringify({rows})});
   const data = await res.json();
   $('exportMsg').innerHTML = data.saved
-     ? '<span class="saved">saved '+data.rows+' rows to '+data.saved+'</span>'
+     ? '<span class="saved">saved \u2192 '+data.saved+' ('+data.rows+' rows in file)</span>'
      : 'save failed';
+  $('rowState').textContent = 'saved';
+  $('savedCount').textContent = data.rows;
   renderRowPreview();
 };
 
@@ -742,9 +786,22 @@ document.addEventListener('keydown', e=>{
   else if(e.key==='h') $('toggleHex').click();
 });
 
-$('savedCount').textContent = Object.keys(saved).length;
-buildDiseasePicker();
-load(idx);
+async function bootstrap(){
+  // 1) CSV is the source of truth
+  try {
+    const data = await (await fetch('/api/rows')).json();
+    Object.assign(saved, data.rows || {});
+  } catch(e){}
+  // 2) overlay localStorage (unsaved edits win)
+  try {
+    const ls = JSON.parse(localStorage.getItem(LS_KEY)||'{}');
+    Object.assign(saved, ls);
+  } catch(e){}
+  $('savedCount').textContent = Object.keys(saved).length;
+  buildDiseasePicker();
+  load(idx);
+}
+bootstrap();
 </script>
 </body>
 </html>

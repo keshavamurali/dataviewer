@@ -229,8 +229,8 @@ def main():
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--out", default=None,
-                    help="optional path; Export also writes the CSV here")
+    ap.add_argument("--out", default="labels.csv",
+                    help="CSV save path (default: labels.csv in the current directory)")
     a = ap.parse_args()
 
     State.docs = pq.read_table(a.pack).to_pylist()
@@ -246,7 +246,7 @@ def main():
     print(f"Loaded {len(State.docs)} documents from {a.pack}")
     print(f"Serving on {a.host}:{a.port}  ->  open {url}  (Ctrl-C to stop)")
     if State.out_path:
-        print(f"Export will also write: {os.path.abspath(State.out_path)}")
+        print(f"Save button writes: {os.path.abspath(State.out_path)}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -336,7 +336,7 @@ PAGE = r"""<!doctype html>
   <input id="jumpId" placeholder="jump to doc_id" style="width:160px">
   <button id="goId">go</button>
   <button id="toggleMd">markdown preview</button>
-  <button id="toggleHex">hex dump</button>
+  <button id="toggleHex" class="active">hex dump</button>
   <span class="meta" id="meta"></span>
 </header>
 
@@ -366,15 +366,15 @@ PAGE = r"""<!doctype html>
       <span id="rowState" class="hint"></span>
     </div>
 
-    <h3>Export (<span id="savedCount">0</span> rows)</h3>
+    <h3>Save (<span id="savedCount">0</span> rows)</h3>
     <div class="row-actions">
-      <button id="exportBtn">build + download CSV</button>
+      <button id="exportBtn">save labels.csv</button>
     </div>
-    <textarea id="exportBox" readonly placeholder="CSV preview appears here"></textarea>
+    <textarea id="exportBox" readonly placeholder="current row (CSV) appears here"></textarea>
     <div class="hint" id="exportMsg"></div>
 
-    <h3 id="hexHead" style="display:none">Hex dump (non-ASCII / control / separator)</h3>
-    <div id="hexList" style="display:none"></div>
+    <h3 id="hexHead">Hex dump (non-ASCII / control / separator)</h3>
+    <div id="hexList"></div>
   </div>
 </div>
 
@@ -524,6 +524,7 @@ function onDxCheck(){
   all.sort((a,b)=>(DX_ORDER[a]??999)-(DX_ORDER[b]??999));
   $('f_diseases').value = all.join(';');
   updateHexWarn();
+  renderRowPreview();
 }
 // diseases string -> checkbox states (for load / manual typing)
 function syncDiseaseChecks(){
@@ -603,6 +604,11 @@ function onCursor(){
     }
   } else {
     $('selstatus').innerHTML=''; window._selFill=null;
+    if(off!==null && off!==undefined){
+      navigator.clipboard && navigator.clipboard.writeText(String(off)).then(()=>{
+        $('status').innerHTML = describeOffset(off) + ' <span class="saved">\u2713 copied</span>';
+      }).catch(()=>{});
+    }
   }
 }
 
@@ -618,11 +624,33 @@ function fillFields(docId){
   $('rowState').textContent = saved[docId] ? 'saved' : '';
   syncDiseaseChecks();
   updateHexWarn();
+  renderRowPreview();
 }
 
 function updateHexWarn(){
   const dis=($('f_diseases').value||'').toUpperCase();
   $('hexWarn').style.display = (dis.includes('F1')||dis.includes('E3')) ? 'block':'none';
+}
+
+// CSV-quote one field to match Python csv (quote if it has , " or newline; double quotes)
+function csvField(s){
+  s = (s==null)?'':String(s);
+  return /[",\n\r]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s;
+}
+const CSV_HEADER = 'doc_id,read,verdict,diseases,evidence,hex,note';
+function currentRowValues(){
+  return {
+    doc_id: $('f_doc_id').value, read: $('f_read').value, verdict: $('f_verdict').value,
+    diseases: $('f_diseases').value, evidence: $('f_evidence').value,
+    hex: $('f_hex').value, note: $('f_note').value,
+  };
+}
+// Live preview of the row being built, in the CSV box below the save button.
+function renderRowPreview(){
+  const r = currentRowValues();
+  const line = ['doc_id','read','verdict','diseases','evidence','hex','note']
+                 .map(k=>csvField(r[k])).join(',');
+  $('exportBox').value = CSV_HEADER + '\n' + line;
 }
 
 async function load(i){
@@ -673,7 +701,11 @@ document.addEventListener('selectionchange', ()=>{ if(document.activeElement && 
 // use current selection to fill evidence+hex
 $('f_evidence').addEventListener('focus', ()=>{ if(window._selFill && !$('f_evidence').value){ $('f_evidence').value=window._selFill.evidence; } });
 $('f_hex').addEventListener('focus', ()=>{ if(window._selFill && !$('f_hex').value){ $('f_hex').value=window._selFill.hex; } });
-$('f_diseases').addEventListener('input', ()=>{ syncDiseaseChecks(); updateHexWarn(); });
+$('f_diseases').addEventListener('input', ()=>{ syncDiseaseChecks(); updateHexWarn(); renderRowPreview(); });
+['f_read','f_verdict','f_evidence','f_hex','f_note'].forEach(id=>{
+  $(id).addEventListener('input', renderRowPreview);
+  $(id).addEventListener('change', renderRowPreview);
+});
 
 $('saveRow').onclick = ()=>{
   if(!cur) return;
@@ -696,12 +728,10 @@ $('exportBtn').onclick = async ()=>{
   const res = await fetch('/api/export', {method:'POST', headers:{'Content-Type':'application/json'},
      body: JSON.stringify({rows})});
   const data = await res.json();
-  $('exportBox').value = data.csv;
-  $('exportMsg').innerHTML = data.saved ? '<span class="saved">server wrote '+data.saved+'</span>' : 'downloaded in browser';
-  // browser download
-  const blob = new Blob([data.csv], {type:'text/csv'});
-  const a = document.createElement('a'); a.href=URL.createObjectURL(blob);
-  a.download='labels.csv'; a.click();
+  $('exportMsg').innerHTML = data.saved
+     ? '<span class="saved">saved '+data.rows+' rows to '+data.saved+'</span>'
+     : 'save failed';
+  renderRowPreview();
 };
 
 document.addEventListener('keydown', e=>{

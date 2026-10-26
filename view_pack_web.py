@@ -526,9 +526,9 @@ const DISEASES = [
    ["H2","near duplicate","same text with small changes"],
    ["H3","same content in another source or language","translation of a doc seen in English"]]],
 ];
-// canonical order index for sorting the picked codes
-const DX_ORDER = {}; let _k=0;
-DISEASES.forEach(([,,items])=>items.forEach(([code])=>{ DX_ORDER[code]=_k++; }));
+// all catalog codes, to tell ticked codes from typed-in unknown ones
+const DX_KNOWN = new Set();
+DISEASES.forEach(([,,items])=>items.forEach(([code])=>DX_KNOWN.add(code)));
 
 function buildDiseasePicker(){
   const box = $('dxSections'); box.innerHTML='';
@@ -551,14 +551,15 @@ function buildDiseasePicker(){
   }
 }
 function dxCheckboxes(){ return Array.from($('dxSections').querySelectorAll('input[data-dx]')); }
-// checkboxes -> diseases string (canonical order), preserving any typed-in unknown codes
+// checkboxes -> diseases string in the order picked (so it lines up with evidence/hex):
+// existing codes keep their place, unticked ones drop out, newly ticked ones go last;
+// typed-in unknown codes are preserved
 function onDxCheck(){
-  const ticked = dxCheckboxes().filter(c=>c.checked).map(c=>c.value);
-  const known = new Set(Object.keys(DX_ORDER));
+  const ticked = new Set(dxCheckboxes().filter(c=>c.checked).map(c=>c.value));
   const existing = ($('f_diseases').value||'').split(';').map(s=>s.trim()).filter(Boolean);
-  const unknown = existing.filter(c=>!known.has(c.toUpperCase()));
-  const all = [...new Set([...ticked, ...unknown])];
-  all.sort((a,b)=>(DX_ORDER[a]??999)-(DX_ORDER[b]??999));
+  const kept = existing.map(c=>DX_KNOWN.has(c.toUpperCase()) ? c.toUpperCase() : c)
+                       .filter(c=>!DX_KNOWN.has(c) || ticked.has(c));
+  const all = [...new Set([...kept, ...ticked])];
   $('f_diseases').value = all.join(';');
   updateHexWarn();
   renderRowPreview();

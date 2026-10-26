@@ -16,6 +16,10 @@ Features
     in the exact format of labels_TEMPLATE.csv.
   * Markdown preview: a rendered preview of the document (toggle).
   * Hex dump pane: same offset / code-point / Unicode-name list as the script.
+  * Disease highlights: candidates for DISEASES.md sections A (characters) and
+    B (markup and ghost tokens) are highlighted in the diagnostic pane and
+    listed with one-click "+" to tick the code and append evidence/hex.
+    B3 ghost markers get a red banner. Toggle highlights with "g".
   * Per-row annotation: textboxes for every CSV column (read, verdict,
     diseases, evidence, hex, note). Save keeps the row; Export downloads a CSV
     matching labels_TEMPLATE.csv exactly.
@@ -32,7 +36,9 @@ import html
 import io
 import json
 import os
+import re
 import unicodedata
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pyarrow.parquet as pq
@@ -90,7 +96,7 @@ def hexdump_rows(text: str, limit: int = 2000):
     return rows
 
 
-def segments(text: str):
+def segments(text: str, marks=None):
     """Split text into display segments carrying raw code-point offsets.
 
     Each segment is one of:
@@ -101,32 +107,263 @@ def segments(text: str):
     A newline is emitted as its own text segment so the frontend can break
     lines while keeping exact offsets. Offsets are code-point indices into the
     raw text (what Python text[off] returns).
+
+    marks (optional, from detect()) is a per-character list of finding dicts or
+    None; a run is split wherever the finding changes, and segments inside a
+    finding carry "dx" (disease code) and "dxl" (label) for highlighting.
     """
     segs = []
     buf = []
     buf_start = 0
+
+    def mark_of(i):
+        return marks[i] if marks else None
+
+    def flush():
+        if buf:
+            seg = {"t": "text", "s": "".join(buf), "off": buf_start}
+            m = mark_of(buf_start)
+            if m:
+                seg["dx"], seg["dxl"] = m["code"], m["label"]
+            segs.append(seg)
+            buf.clear()
+
     for i, ch in enumerate(text):
         tok = token_for(ch)
         if tok is None and ch != "\n":
+            if buf and mark_of(i) is not mark_of(i - 1):
+                flush()
             if not buf:
                 buf_start = i
             buf.append(ch)
             continue
-        # flush any pending normal run
-        if buf:
-            segs.append({"t": "text", "s": "".join(buf), "off": buf_start})
-            buf = []
+        flush()
         if ch == "\n":
             segs.append({"t": "text", "s": "\n", "off": i})
         else:
-            segs.append({
+            seg = {
                 "t": "tok", "s": tok, "raw": ch, "off": i,
                 "cp": f"U+{ord(ch):04X}",
                 "name": unicodedata.name(ch, "?"),
-            })
-    if buf:
-        segs.append({"t": "text", "s": "".join(buf), "off": buf_start})
+            }
+            m = mark_of(i)
+            if m:
+                seg["dx"], seg["dxl"] = m["code"], m["label"]
+            segs.append(seg)
+    flush()
     return segs
+
+
+# ---------------------------------------------------------------------------
+# Disease detectors for sections A (characters) and B (markup and ghost
+# tokens) of DISEASES.md. They only highlight candidates; the reader decides.
+# ---------------------------------------------------------------------------
+# A1: invisible junk. ZWJ U+200D / ZWNJ U+200C are deliberately absent: they
+# are part of Indic script, not a disease.
+A1_CHARS = {
+    "\u200b": "zero-width space", "\ufeff": "BOM / zero-width no-break space",
+    "\u00ad": "soft hyphen", "\u2060": "word joiner",
+    "\u200e": "bidi mark (LRM)", "\u200f": "bidi mark (RLM)", "\u061c": "bidi mark (ALM)",
+    **{chr(c): "bidi control" for c in range(0x202A, 0x202F)},
+    **{chr(c): "bidi isolate" for c in range(0x2066, 0x206A)},
+}
+
+
+def _is_a2(ch):
+    o = ord(ch)
+    return (o < 0x20 and ch not in "\t\n") or 0x7F <= o <= 0x9F
+
+
+# A3: UTF-8 bytes shown as cp1252/latin-1, e.g. "â€™", "Ã¤", "à¤¹". A
+# continuation byte 0x80-0xBF appears as its cp1252 char (or raw latin-1 for
+# the bytes cp1252 leaves undefined).
+def _cp1252_char(b):
+    try:
+        return bytes([b]).decode("cp1252")
+    except UnicodeDecodeError:
+        return bytes([b]).decode("latin-1")
+
+
+_BYTE_OF = {_cp1252_char(b): b for b in range(0x80, 0x100)}
+_CONT = "[" + "".join(sorted({_cp1252_char(b) for b in range(0x80, 0xC0)}
+                             | {chr(b) for b in range(0x80, 0xC0)})) + "]"
+MOJIBAKE_RE = re.compile(
+    "(?:[\u00c2-\u00df]" + _CONT + "|[\u00e0-\u00ef]" + _CONT + "{2}"
+    "|[\u00f0-\u00f4]" + _CONT + "{3})+")
+
+
+def _unmojibake(s):
+    """Return the intended text if s is UTF-8 decoded as cp1252, else None."""
+    try:
+        return bytes(_BYTE_OF.get(c, ord(c)) for c in s).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+_HTML_TAGS = (
+    "a|abbr|article|aside|audio|b|blockquote|body|br|button|center|code|div|em|"
+    "figcaption|figure|font|footer|form|h[1-6]|head|header|hr|html|i|iframe|img|"
+    "input|label|li|link|main|meta|nav|noscript|ol|option|p|path|pre|script|"
+    "section|select|small|source|span|strong|style|sub|sup|svg|table|tbody|td|"
+    "th|thead|title|tr|u|ul|video")
+
+# (code, regex, label). B3 first: it is the most dangerous disease.
+PATTERNS = [
+    ("B3", re.compile(r"<\|[A-Za-z0-9_.\- ]{1,40}\|>"), "ghost special token"),
+    ("B3", re.compile(r"\[/?INST\]|<</?SYS>>"), "ghost chat marker"),
+    ("B3", re.compile(r"</?s>"), "ghost BOS/EOS marker <s>"),
+    ("B3", re.compile(r"</?think(?:ing)?>"), "ghost reasoning tag"),
+    ("B3", re.compile(r"<(?:bos|eos|unk|pad|mask|start_of_turn|end_of_turn)>"
+                      r"|\[(?:CLS|SEP|MASK|PAD|UNK)\]"), "ghost special token"),
+    ("B3", re.compile(r"(?mi)^[ \t]*#{1,4}[ \t]*(?:assistant|user|human|system|"
+                      r"instruction|response)[ \t]*:"), "ghost role header"),
+    ("B3", re.compile(r"(?m)^[ \t]*(?:Human|Assistant)[ \t]*:"), "ghost role prefix"),
+    ("B2", re.compile(r"<!--.{0,500}?-->|<!DOCTYPE[^>]{0,200}>|<\?xml[^>]{0,200}\?>",
+                      re.S | re.I), "HTML/XML comment or declaration"),
+    # attributes must have values, so math like "a<b and c>d" is not a tag
+    ("B2", re.compile(r"</?(?:" + _HTML_TAGS + r")(?:\s+[\w:-]+\s*=\s*(?:\"[^\"<>]*\"|'[^'<>]*'|[^\s<>]+))*"
+                      r"\s*/?>", re.I), "HTML tag"),
+    ("B1", re.compile(r"&(?:#\d{1,7};?|#[xX][0-9A-Fa-f]{1,6};?|[A-Za-z][A-Za-z0-9]{1,31};"
+                      r"|(?:nbsp|amp|lt|gt|quot|apos)\b)"), "HTML entity"),
+    ("B4", re.compile(r"\{\{.{0,200}?\}\}|\{%.{0,200}?%\}"), "template placeholder"),
+    ("B4", re.compile(r"\$\{[^}\n]{0,100}\}"), "template placeholder ${...}"),
+    ("B4", re.compile(r"\b(?:undefined|NaN)\b|\[object Object\]"), "code junk value"),
+]
+
+# lang_label script suffix (e.g. kan_Knda) -> Unicode name prefix
+SCRIPT_OF_LABEL = {
+    "Knda": "KANNADA", "Deva": "DEVANAGARI", "Beng": "BENGALI", "Taml": "TAMIL",
+    "Telu": "TELUGU", "Mlym": "MALAYALAM", "Gujr": "GUJARATI", "Guru": "GURMUKHI",
+    "Orya": "ORIYA", "Latn": "LATIN", "Arab": "ARABIC", "Cyrl": "CYRILLIC",
+}
+# A code's priority when findings overlap: earlier wins the highlight.
+PRIORITY = ["B3", "A4", "A1", "A3", "A2", "B5", "B2", "B1", "B4", "A5", "A6"]
+
+
+def _script(ch):
+    """Unicode script name prefix for a letter or mark, else None."""
+    cat = unicodedata.category(ch)
+    if cat[0] not in "LM" or cat == "Lm":   # Lm: modifier letters act like punctuation
+        return None
+    first = unicodedata.name(ch, "").split(" ")[0]
+    return None if first in ("", "COMBINING") else first
+
+
+def _char_runs(text, classify):
+    """Yield (start, end, label) for runs of consecutive chars with the same label."""
+    start, label = None, None
+    for i, ch in enumerate(text):
+        lab = classify(ch)
+        if lab != label:
+            if label is not None:
+                yield start, i, label
+            start, label = i, lab
+    if label is not None:
+        yield start, len(text), label
+
+
+def _unclosed_latex(text):
+    """B5: \\cmd{ whose brace never closes (any of its {..}{..} arguments),
+    \\begin{env} with no \\end{env}, odd $$."""
+    out = []
+    for m in re.finditer(r"\\[A-Za-z]+\s*\{", text):
+        depth, j = 1, m.end()
+        while j < len(text) and depth:
+            if text[j] == "\\":
+                j += 2
+                continue
+            depth += {"{": 1, "}": -1}.get(text[j], 0)
+            j += 1
+            if depth == 0 and j < len(text) and text[j] == "{":   # next argument group
+                depth, j = 1, j + 1
+        if depth:
+            out.append((m.start(), m.end(), "unclosed " + m.group(0).strip()))
+    for env in set(re.findall(r"\\begin\{([^}\n]{1,40})\}", text)):
+        begins = list(re.finditer(r"\\begin\{" + re.escape(env) + r"\}", text))
+        extra = len(begins) - len(re.findall(r"\\end\{" + re.escape(env) + r"\}", text))
+        for m in begins[len(begins) - extra:] if extra > 0 else []:
+            out.append((m.start(), m.end(), f"\\begin{{{env}}} with no \\end"))
+    dd = [m.start() for m in re.finditer(r"\$\$", text)]
+    if len(dd) % 2:
+        out.append((dd[-1], dd[-1] + 2, "unpaired $$"))
+    return out
+
+
+def _unclosed_fence(text):
+    """B5: a ``` / ~~~ code fence that is opened but never closed."""
+    open_at = None
+    for m in re.finditer(r"(?m)^[ \t]*(```|~~~)", text):
+        open_at = None if open_at is not None else (m.start(1), m.end(1))
+    return [(*open_at, "unclosed code fence")] if open_at else []
+
+
+def _hex(s, cap=64):
+    cps = [f"U+{ord(c):04X}" for c in s[:cap]]
+    return " ".join(cps) + (" …" if len(s) > cap else "")
+
+
+def detect(text, lang_label=""):
+    """Find section A/B disease candidates in text.
+
+    Returns (findings, marks): findings is a list of
+    {code, start, end, label, evidence, hex} sorted by offset (hex only for the
+    A group, as the label sheet asks); marks is a per-character list holding the
+    finding that highlights that character (or None).
+    """
+    raw = []
+    for s, e, lab in _char_runs(text, lambda ch: A1_CHARS.get(ch)):
+        raw.append(("A1", s, e, lab))
+    for s, e, lab in _char_runs(text, lambda ch: "control character" if _is_a2(ch) else None):
+        raw.append(("A2", s, e, lab))
+    for s, e, lab in _char_runs(text, lambda ch: "replacement character" if ch == "\ufffd" else None):
+        raw.append(("A4", s, e, f"{lab} x{e - s}" if e - s > 1 else lab))
+    for m in MOJIBAKE_RE.finditer(text):
+        fixed = _unmojibake(m.group(0))
+        if fixed is not None:
+            raw.append(("A3", m.start(), m.end(), f"mojibake, should be {fixed!r}"))
+    for code, rx, lab in PATTERNS:
+        for m in rx.finditer(text):
+            raw.append((code, m.start(), m.end(), lab))
+    for s, e, lab in _unclosed_fence(text) + _unclosed_latex(text):
+        raw.append(("B5", s, e, lab))
+
+    expected = SCRIPT_OF_LABEL.get(lang_label.rpartition("_")[2])
+    nfc_ok = unicodedata.is_normalized("NFC", text)
+    if not nfc_ok:
+        for m in re.finditer(r"\S+", text):
+            tok = m.group(0)
+            if not unicodedata.is_normalized("NFC", tok):
+                raw.append(("A5", m.start(), m.end(),
+                            f"not NFC; NFC form is {unicodedata.normalize('NFC', tok)!r}"))
+    # A6 words: runs of letters/marks (ZWJ/ZWNJ included), so punctuation splits words
+    is_wordch = lambda ch: "w" if ch in "\u200c\u200d" or _script(ch) else None
+    for s, e, _ in _char_runs(text, is_wordch):
+        scripts = {sc for sc in map(_script, text[s:e]) if sc}
+        if len(scripts) > 1:
+            raw.append(("A6", s, e, "mixed scripts in one word: " + "+".join(sorted(scripts))))
+        elif expected and scripts and scripts - {expected, "LATIN"}:
+            raw.append(("A6", s, e, f"{scripts.pop()} word in {lang_label} text"))
+
+    # keep a finding unless higher-priority findings already cover all of it
+    raw.sort(key=lambda f: (PRIORITY.index(f[0]), f[1]))
+    marks = [None] * len(text)
+    findings = []
+    for code, s, e, lab in raw:
+        if all(marks[i] is not None for i in range(s, e)):
+            continue
+        seg = text[s:e]
+        ev = show(seg)
+        f = {
+            "code": code, "start": s, "end": e, "label": lab,
+            "evidence": (ev if len(ev) <= 60 else ev[:57] + "…") + f" at offset {s}",
+            "hex": _hex(seg) if code.startswith("A") else "",
+        }
+        findings.append(f)
+        for i in range(s, e):
+            if marks[i] is None:
+                marks[i] = f
+    findings.sort(key=lambda f: (f["start"], PRIORITY.index(f["code"])))
+    return findings, marks
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +378,7 @@ class State:
 def doc_payload(i: int):
     d = State.docs[i]
     text = d.get("text", "") or ""
+    findings, marks = detect(text, d.get("lang_label", "") or "")
     return {
         "i": i,
         "count": len(State.docs),
@@ -150,9 +388,14 @@ def doc_payload(i: int):
         "url": d.get("url", "") or "",
         "chars": len(text),
         "raw_text": text,
-        "segments": segments(text),
+        "segments": segments(text, marks),
         "hexdump": hexdump_rows(text),
+        "dx_counts": dict(Counter(f["code"] for f in findings)),
+        "findings": findings[:MAX_FINDINGS],
     }
+
+
+MAX_FINDINGS = 1000  # rows sent to the browser per document; counts are always complete
 
 
 FIELDNAMES = ["doc_id", "read", "verdict", "diseases", "evidence", "hex", "note"]
@@ -275,7 +518,7 @@ def main():
     start = max(0, min(a.start, len(State.docs) - 1)) if State.docs else 0
 
     global PAGE
-    PAGE = PAGE.replace("__START__", str(start))
+    PAGE = PAGE.replace("__START__", str(start)).replace("__VISIBLE__", json.dumps(VISIBLE))
 
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     shown_host = "127.0.0.1" if a.host == "0.0.0.0" else a.host
@@ -323,6 +566,26 @@ PAGE = r"""<!doctype html>
           font-size:13px; }
   .tok { color:var(--tok); background:var(--tokbg); border-radius:3px;
          padding:0 2px; cursor:help; }
+  /* disease highlights: A = characters (orange), B = markup (purple), B3 = ghost markers (red) */
+  .dx { border-bottom:2px solid; cursor:pointer; }
+  .dxA { background:rgba(255,165,0,.22); border-color:#ffa500; }
+  .dxB { background:rgba(170,120,255,.25); border-color:#aa78ff; }
+  .dxB3 { background:rgba(255,70,70,.45); border-color:#ff4646; font-weight:bold; }
+  #diag.nohl .dx { background:transparent; border-bottom:none; font-weight:inherit; }
+  #dxBanner { display:none; background:#5a1a1a; color:#ffd0d0; padding:6px 10px;
+              border-radius:4px; margin-bottom:8px; font-size:12px; }
+  #dxList { max-height:280px; overflow:auto; font-size:12px; }
+  .dxrow { display:flex; gap:6px; align-items:baseline; padding:3px 2px; cursor:pointer;
+           border-bottom:1px solid #2c2c2c; }
+  .dxrow:hover { background:#2d2d2d; }
+  .dxrow.added { opacity:.5; }
+  .dxrow .dxev { font-family:monospace; word-break:break-all; }
+  .dxrow small { color:var(--muted); }
+  .dxc { font-family:monospace; padding:0 3px; border-radius:3px; border-bottom:none; }
+  .dxadd { padding:0 7px; }
+  .chip { display:inline-block; margin:0 4px 4px 0; padding:1px 7px; border-radius:10px;
+          font-size:11px; cursor:pointer; border:1px solid var(--border); }
+  .chip.on { outline:1px solid var(--accent); }
   #md { line-height:1.6; max-width:52em; }
   #md pre { background:#111; padding:10px; overflow:auto; border-radius:4px; }
   #md code { background:#111; padding:1px 4px; border-radius:3px; }
@@ -374,11 +637,13 @@ PAGE = r"""<!doctype html>
   <button id="goId">go</button>
   <button id="toggleMd">markdown preview</button>
   <button id="toggleHex" class="active">hex dump</button>
+  <button id="toggleDx" class="active">highlights</button>
   <span class="meta" id="meta"></span>
 </header>
 
 <div class="wrap">
   <div class="left">
+    <div id="dxBanner"></div>
     <div id="diag"></div>
     <div id="md" style="display:none"></div>
   </div>
@@ -408,6 +673,11 @@ PAGE = r"""<!doctype html>
     </div>
     <textarea id="exportBox" readonly placeholder="current row (CSV) appears here"></textarea>
     <div class="hint" id="exportMsg"></div>
+
+    <h3>Detected A/B candidates <span id="dxTotal"></span></h3>
+    <div class="hint" style="margin-bottom:6px">Click a row to select it in the text; + ticks the code and appends evidence (and hex for A).</div>
+    <div id="dxCounts"></div>
+    <div id="dxList"></div>
 
     <h3 id="hexHead">Hex dump (all characters)</h3>
     <div id="hexList"></div>
@@ -471,10 +741,24 @@ function renderMarkdown(text){
 // ---- state ----
 let cur = null;           // current doc payload
 let idx = parseInt("__START__",10) || 0;
-const saved = {};         // doc_id -> row object (persisted in localStorage)
+const VISIBLE = __VISIBLE__;   // same hidden-char tokens as the Python show()
+const saved = {};         // doc_id -> row object (what the UI shows)
+let disk = {};            // doc_id -> row as last read from labels.csv
 const LS_KEY = 'view_pack_web_rows';
-// NOTE: seeding happens in bootstrap(): CSV (source of truth) first,
-// then localStorage overlaid on top as the unsaved-edit buffer.
+// NOTE: seeding happens in bootstrap(): CSV (source of truth) first, then
+// localStorage overlaid on top. localStorage holds ONLY unsaved edits (rows that
+// differ from the CSV), and save sends only those rows, so rows changed in
+// labels.csv by someone else are never overwritten by a stale browser copy.
+const ROW_KEYS = ['doc_id','read','verdict','diseases','evidence','hex','note'];
+function sameRow(a, b){ return !!a && !!b && ROW_KEYS.every(k=>(a[k]||'')===(b[k]||'')); }
+function dirtyRows(){
+  const out = {};
+  for(const [k, r] of Object.entries(saved)) if(!sameRow(r, disk[k])) out[k] = r;
+  return out;
+}
+function persistLocal(){
+  try { localStorage.setItem(LS_KEY, JSON.stringify(dirtyRows())); } catch(e){}
+}
 
 const $ = id => document.getElementById(id);
 
@@ -582,15 +866,93 @@ function renderDiag(payload){
       if(seg.s==='\n'){ diag.appendChild(document.createTextNode('\n')); continue; }
       const span=document.createElement('span');
       span.textContent=seg.s; span.dataset.off=seg.off; span.dataset.len=cpLen(seg.s);
-      span.dataset.kind='text'; diag.appendChild(span);
+      span.dataset.kind='text'; markDx(span, seg); diag.appendChild(span);
     } else {
       const span=document.createElement('span');
       span.className='tok'; span.textContent=seg.s;
       span.dataset.off=seg.off; span.dataset.len=1; span.dataset.kind='tok';
       span.dataset.raw=seg.raw; span.dataset.cp=seg.cp; span.dataset.name=seg.name;
       span.title=seg.cp+' '+seg.name+'  (offset '+seg.off+')';
-      diag.appendChild(span);
+      markDx(span, seg); diag.appendChild(span);
     }
+  }
+}
+
+function dxClass(code){ return 'dx'+code[0]+' dx'+code; }
+function markDx(span, seg){
+  if(!seg.dx) return;
+  span.className += ' dx '+dxClass(seg.dx);
+  span.title = seg.dx+': '+seg.dxl + (span.title ? '  |  '+span.title : '  (offset '+seg.off+')');
+}
+
+// DOM position for a raw code-point offset; isEnd places it just after char off-1.
+function domPos(off, isEnd){
+  const target = isEnd ? off-1 : off;
+  for(const span of $('diag').querySelectorAll('span[data-off]')){
+    const o=+span.dataset.off, n=+span.dataset.len;
+    if(target>=o && target<o+n){
+      const k = target-o + (isEnd?1:0);
+      if(span.dataset.kind==='tok') return [span, k];
+      return [span.firstChild, Array.from(span.textContent).slice(0,k).join('').length];
+    }
+  }
+  return null;
+}
+// Select raw range [s,e) in the diagnostic pane, as if the reader had dragged over it.
+function selectRange(s, e){
+  if($('diag').style.display==='none') $('toggleMd').click();
+  const a=domPos(s,false), b=domPos(e,true); if(!a||!b) return;
+  const r=document.createRange(); r.setStart(a[0],a[1]); r.setEnd(b[0],b[1]);
+  const sel=window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+  (a[0].nodeType===3?a[0].parentElement:a[0]).scrollIntoView({block:'center'});
+  onCursor();
+}
+
+// ---- detected A/B candidates panel ----
+let dxFilter = null;
+function markFinding(f){
+  const cb = dxCheckboxes().find(c=>c.value===f.code);
+  if(cb && !cb.checked){ cb.checked=true; onDxCheck(); }
+  appendValue('f_evidence', f.evidence);
+  if(f.hex) appendValue('f_hex', f.hex);
+  renderRowPreview();
+}
+function renderFindings(){
+  const counts = cur.dx_counts||{}, codes = Object.keys(counts).sort();
+  const total = codes.reduce((a,c)=>a+counts[c],0);
+  $('dxTotal').textContent = total ? '('+total+')' : '';
+  const banner=$('dxBanner');
+  banner.style.display = counts.B3 ? 'block' : 'none';
+  banner.textContent = counts.B3 ? '\u26a0 B3 ghost chat markers: '+counts.B3+'. Most dangerous disease: a ghost marker teaches the model to write our special tokens as plain text.' : '';
+  const cbox=$('dxCounts'); cbox.innerHTML='';
+  for(const c of codes){
+    const chip=document.createElement('span');
+    chip.className='chip '+dxClass(c)+(dxFilter===c?' on':'');
+    chip.textContent=c+' \u00d7'+counts[c]; chip.title='show only '+c+' (click again for all)';
+    chip.onclick=()=>{ dxFilter = dxFilter===c ? null : c; renderFindings(); };
+    cbox.appendChild(chip);
+  }
+  const list=$('dxList'); list.innerHTML='';
+  if(!total){ list.innerHTML='<div class="hint">(none found)</div>'; return; }
+  const have = new Set(($('f_evidence').value||'').split('; '));
+  for(const f of cur.findings.filter(f=>!dxFilter||f.code===dxFilter)){
+    const row=document.createElement('div'); row.className='dxrow'+(have.has(f.evidence)?' added':'');
+    const add=document.createElement('button'); add.className='dxadd'; add.textContent='+';
+    add.title='tick '+f.code+', append evidence'+(f.hex?' and hex':'');
+    add.onclick=ev=>{ ev.stopPropagation(); markFinding(f); row.classList.add('added'); };
+    const code=document.createElement('span'); code.className='dxc '+dxClass(f.code); code.textContent=f.code;
+    const body=document.createElement('div');
+    const evs=document.createElement('span'); evs.className='dxev'; evs.textContent=f.evidence;
+    const lab=document.createElement('small'); lab.textContent=f.label;
+    body.append(evs, document.createElement('br'), lab);
+    row.append(add, code, body);
+    row.onclick=()=>selectRange(f.start, f.end);
+    list.appendChild(row);
+  }
+  if(cur.findings.length < total){
+    const more=document.createElement('div'); more.className='hint';
+    more.textContent='(list shows the first '+cur.findings.length+' of '+total+')';
+    list.appendChild(more);
   }
 }
 
@@ -636,7 +998,7 @@ function onCursor(){
       const raw = arr.join('');
       const hex = arr.map(c=>'U+'+c.codePointAt(0).toString(16).toUpperCase().padStart(4,'0')).join(' ');
       // visible form of selection for evidence
-      const vis = arr.map(c=>{ const n=c.codePointAt(0); return (n<32||n===127)?('\u27e6U+'+n.toString(16).toUpperCase().padStart(4,'0')+'\u27e7'):c; }).join('');
+      const vis = arr.map(c=>{ if(VISIBLE[c]) return VISIBLE[c]; const n=c.codePointAt(0); return (n<32||(n>=127&&n<=159))?('\u27e6U+'+n.toString(16).toUpperCase().padStart(4,'0')+'\u27e7'):c; }).join('');
       $('selstatus').innerHTML = 'selected ['+startOff+'\u2013'+endOff+'] \u00b7 '+hex;
       window._selFill = { evidence: vis+' at offset '+startOff, hex: hex };
     }
@@ -708,6 +1070,7 @@ async function load(i){
     ? cur.hexdump.map(h=>'<div class="hexrow">'+String(h.offset).padStart(6)+'  '+h.cp+'  '+escapeHtml(h.name)+'</div>').join('')
     : '<div class="hint">(empty document)</div>';
   fillFields(cur.doc_id);
+  dxFilter = null; renderFindings();
   $('status').innerHTML='offset: \u2013'; $('selstatus').innerHTML='';
 }
 
@@ -727,6 +1090,10 @@ $('toggleMd').onclick = e => {
   md.style.display = on?'block':'none'; dg.style.display = on?'none':'block';
   e.target.classList.toggle('active', on);
 };
+$('toggleDx').onclick = e => {
+  const on = $('diag').classList.toggle('nohl');
+  e.target.classList.toggle('active', !on);
+};
 $('toggleHex').onclick = e => {
   const on = $('hexList').style.display==='none';
   $('hexList').style.display = on?'block':'none';
@@ -744,10 +1111,13 @@ function appendSelFill(fieldId, key){
   const used = key+'Used';
   if(!f || f[used]) return;
   f[used] = true;
-  const el = $(fieldId);
-  if(el.value.split('; ').includes(f[key])) return;   // same span already recorded
-  el.value = el.value ? el.value+'; '+f[key] : f[key];
+  appendValue(fieldId, f[key]);
   renderRowPreview();
+}
+function appendValue(fieldId, value){
+  const el = $(fieldId);
+  if(el.value.split('; ').includes(value)) return;   // same span already recorded
+  el.value = el.value ? el.value+'; '+value : value;
 }
 $('f_evidence').addEventListener('focus', ()=>appendSelFill('f_evidence', 'evidence'));
 $('f_hex').addEventListener('focus', ()=>appendSelFill('f_hex', 'hex'));
@@ -764,24 +1134,33 @@ function commitCurrent(){
   const r = currentRowValues();
   // keep a row only if something was entered
   const nonEmpty = ['read','verdict','diseases','evidence','hex','note'].some(k=>r[k]);
-  if(nonEmpty){ saved[cur.doc_id] = r; }
-  localStorage.setItem(LS_KEY, JSON.stringify(saved));
+  // an existing CSV row that is edited down to empty stays in the UI, so it is not lost
+  if(nonEmpty || disk[cur.doc_id]){ saved[cur.doc_id] = r; }
+  persistLocal();
   $('savedCount').textContent = Object.keys(saved).length;
 }
 
 $('clearRow').onclick = ()=>{
   if(!cur) return; delete saved[cur.doc_id];
-  localStorage.setItem(LS_KEY, JSON.stringify(saved));
+  persistLocal();
   fillFields(cur.doc_id); $('savedCount').textContent = Object.keys(saved).length;
   $('exportMsg').textContent = 'cleared in UI (labels.csv unchanged; delete rows there manually)';
 };
 
 $('exportBtn').onclick = async ()=>{
   commitCurrent();
-  const rows = Object.values(saved);
+  const rows = Object.values(dirtyRows());   // only edited rows; the server merges by doc_id
   const res = await fetch('/api/save', {method:'POST', headers:{'Content-Type':'application/json'},
      body: JSON.stringify({rows})});
   const data = await res.json();
+  if(data.saved){
+    // re-read the merged file: it is now the baseline, and picks up rows changed elsewhere
+    try {
+      disk = (await (await fetch('/api/rows')).json()).rows || {};
+      Object.assign(saved, disk);
+    } catch(e){}
+    persistLocal();
+  }
   $('exportMsg').innerHTML = data.saved
      ? '<span class="saved">saved \u2192 '+data.saved+' ('+data.rows+' rows in file)</span>'
      : 'save failed';
@@ -796,19 +1175,22 @@ document.addEventListener('keydown', e=>{
   else if(e.key==='ArrowLeft' || e.key==='b') $('prev').click();
   else if(e.key==='m') $('toggleMd').click();
   else if(e.key==='h') $('toggleHex').click();
+  else if(e.key==='g') $('toggleDx').click();
 });
 
 async function bootstrap(){
   // 1) CSV is the source of truth
   try {
     const data = await (await fetch('/api/rows')).json();
-    Object.assign(saved, data.rows || {});
+    disk = data.rows || {};
+    Object.assign(saved, disk);
   } catch(e){}
   // 2) overlay localStorage (unsaved edits win)
   try {
     const ls = JSON.parse(localStorage.getItem(LS_KEY)||'{}');
     Object.assign(saved, ls);
   } catch(e){}
+  persistLocal();   // drop buffered rows that already match the CSV
   $('savedCount').textContent = Object.keys(saved).length;
   buildDiseasePicker();
   load(idx);

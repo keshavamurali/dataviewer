@@ -431,7 +431,8 @@ def ordered_rows(rowmap):
 
 
 def merge_save(incoming):
-    """Upsert incoming rows into the on-disk CSV by doc_id; never delete.
+    """Upsert incoming rows into the on-disk CSV by doc_id; a row whose fields
+    are all empty removes that doc_id. Rows not sent are never touched.
 
     Re-reads the current file so rows the browser never touched are preserved.
     Returns (abs_path, total_rows).
@@ -439,8 +440,13 @@ def merge_save(incoming):
     disk = read_csv_rows(State.out_path)
     for r in incoming:
         did = (r.get("doc_id") or "").strip()
-        if did:
-            disk[did] = {k: (r.get(k, "") or "") for k in FIELDNAMES}
+        if not did:
+            continue
+        row = {k: (r.get(k, "") or "") for k in FIELDNAMES}
+        if any(row[k] for k in FIELDNAMES if k != "doc_id"):
+            disk[did] = row
+        else:                       # every field emptied in the UI -> remove the row
+            disk.pop(did, None)
     csv_text = rows_to_csv(ordered_rows(disk))
     with open(State.out_path, "w", encoding="utf-8", newline="") as f:
         f.write(csv_text)
@@ -557,6 +563,9 @@ PAGE = r"""<!doctype html>
            border-radius:4px; padding:4px 10px; cursor:pointer; }
   button:hover { background:#3d3d3d; }
   button.active { background:var(--accent); color:#000; }
+  #exportBtn.unsaved { background:#d18616; color:#000; border-color:#d18616; font-weight:bold; }
+  #exportBtn.unsaved:hover { background:#e89a2a; }
+  #exportBtn.clean { background:#2a2a2a; color:var(--muted); }
   .wrap { display:flex; height:calc(100vh - 100px); }
   .left { flex:1 1 60%; overflow:auto; padding:12px; }
   .right { flex:0 0 360px; overflow:auto; padding:12px; background:var(--panel);
@@ -663,13 +672,13 @@ PAGE = r"""<!doctype html>
       <div class="warn" id="hexWarn" style="display:none">F1/E3: leave hex empty. Never paste the value.</div></div>
     <div class="field"><label>note</label><input id="f_note"></div>
     <div class="row-actions">
-      <button id="clearRow">clear this row (UI only)</button>
+      <button id="clearRow">clear this row</button>
       <span id="rowState" class="hint"></span>
     </div>
 
     <h3>Save (<span id="savedCount">0</span> rows in file)</h3>
     <div class="row-actions">
-      <button id="exportBtn">save labels.csv</button>
+      <button id="exportBtn" class="clean">save labels.csv</button>
     </div>
     <textarea id="exportBox" readonly placeholder="current row (CSV) appears here"></textarea>
     <div class="hint" id="exportMsg"></div>
@@ -751,6 +760,7 @@ const LS_KEY = 'view_pack_web_rows';
 // labels.csv by someone else are never overwritten by a stale browser copy.
 const ROW_KEYS = ['doc_id','read','verdict','diseases','evidence','hex','note'];
 function sameRow(a, b){ return !!a && !!b && ROW_KEYS.every(k=>(a[k]||'')===(b[k]||'')); }
+function isEmptyRow(r){ return ROW_KEYS.every(k=>k==='doc_id' || !(r[k]||'')); }
 function dirtyRows(){
   const out = {};
   for(const [k, r] of Object.entries(saved)) if(!sameRow(r, disk[k])) out[k] = r;
@@ -1046,11 +1056,24 @@ function currentRowValues(){
   };
 }
 // Live preview of the row being built, in the CSV box below the save button.
+// Save button: orange while anything differs from labels.csv (the form on screen
+// or rows edited on other documents), grey once everything is saved.
+function updateSaveBtn(){
+  if(!cur) return;
+  const r = currentRowValues(), base = disk[cur.doc_id];
+  const curDirty = base ? !sameRow(r, base)
+                        : ['read','verdict','diseases','evidence','hex','note'].some(k=>r[k]);
+  const n = Object.keys(dirtyRows()).filter(k=>k!==cur.doc_id).length + (curDirty?1:0);
+  const btn = $('exportBtn');
+  btn.classList.toggle('unsaved', n>0); btn.classList.toggle('clean', n===0);
+  btn.textContent = n ? 'save labels.csv \u25cf '+n+' unsaved' : 'save labels.csv (saved)';
+}
 function renderRowPreview(){
   const r = currentRowValues();
   const line = ['doc_id','read','verdict','diseases','evidence','hex','note']
                  .map(k=>csvField(r[k])).join(',');
   $('exportBox').value = CSV_HEADER + '\n' + line;
+  updateSaveBtn();
 }
 
 async function load(i){
@@ -1132,19 +1155,23 @@ $('f_diseases').addEventListener('input', ()=>{ syncDiseaseChecks(); updateHexWa
 function commitCurrent(){
   if(!cur) return;
   const r = currentRowValues();
-  // keep a row only if something was entered
-  const nonEmpty = ['read','verdict','diseases','evidence','hex','note'].some(k=>r[k]);
-  // an existing CSV row that is edited down to empty stays in the UI, so it is not lost
-  if(nonEmpty || disk[cur.doc_id]){ saved[cur.doc_id] = r; }
+  // the form on screen is what gets saved. An emptied row that is in the CSV is
+  // kept as an empty row, which save turns into "remove it"; one that never
+  // reached the CSV is just dropped.
+  if(!isEmptyRow(r) || disk[cur.doc_id]){ saved[cur.doc_id] = r; }
+  else { delete saved[cur.doc_id]; }
   persistLocal();
   $('savedCount').textContent = Object.keys(saved).length;
 }
 
 $('clearRow').onclick = ()=>{
-  if(!cur) return; delete saved[cur.doc_id];
-  persistLocal();
-  fillFields(cur.doc_id); $('savedCount').textContent = Object.keys(saved).length;
-  $('exportMsg').textContent = 'cleared in UI (labels.csv unchanged; delete rows there manually)';
+  if(!cur) return;
+  ['f_read','f_verdict','f_diseases','f_evidence','f_hex','f_note'].forEach(id=>{ $(id).value=''; });
+  syncDiseaseChecks(); updateHexWarn();
+  commitCurrent(); renderRowPreview();
+  $('exportMsg').textContent = disk[cur.doc_id]
+    ? 'cleared; click save to remove this row from labels.csv'
+    : 'cleared';
 };
 
 $('exportBtn').onclick = async ()=>{
@@ -1157,6 +1184,7 @@ $('exportBtn').onclick = async ()=>{
     // re-read the merged file: it is now the baseline, and picks up rows changed elsewhere
     try {
       disk = (await (await fetch('/api/rows')).json()).rows || {};
+      for(const k of Object.keys(saved)) if(!disk[k] && isEmptyRow(saved[k])) delete saved[k];
       Object.assign(saved, disk);
     } catch(e){}
     persistLocal();
